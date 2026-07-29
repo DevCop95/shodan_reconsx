@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/DevCop95/shodan_reconsx)](https://github.com/DevCop95/shodan_reconsx/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-red.svg)](LICENSE)
 
-![Recons101x blood-red ASCII banner](assets/banner.svg)
+![Recons101x blood-red banner](assets/shodanx.png)
 
 Recons101x is a portable passive reconnaissance tool that enumerates hostnames
 published by `ctl.shodan.io`. It runs on Linux, Termux, and Windows using only
@@ -108,7 +108,7 @@ input files, output files, and TXT or JSON formatting.
 ```text
 recons101x/
 |-- assets/
-|   `-- banner.svg
+|   `-- shodanx.png
 |-- src/
 |   `-- recons101x.py
 |-- tests/

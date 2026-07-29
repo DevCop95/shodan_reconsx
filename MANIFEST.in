@@ -5,5 +5,5 @@ include README.md
 include SECURITY.md
 include scan.ps1
 include scan.sh
-recursive-include assets *.svg
+recursive-include assets *.png
 recursive-include tests *.py

@@ -6,6 +6,8 @@
 *.ps1 text eol=lf
 *.md text eol=lf
 *.toml text eol=lf
+*.in text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.svg text eol=lf
+*.png binary

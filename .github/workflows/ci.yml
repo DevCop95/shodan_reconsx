@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: Static security analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned security scanner
+        run: python -m pip install bandit==1.8.6
+
+      - name: Scan source
+        run: bandit --recursive --severity-level medium --confidence-level medium src
+
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install project
+        run: python -m pip install --no-deps --editable .
+
+      - name: Compile source
+        run: python -m compileall -q src tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify installed command
+        run: recons101x --version
+
+      - name: Verify shell launcher
+        if: runner.os == 'Linux'
+        run: bash -n scan.sh && bash scan.sh --version
+
+      - name: Verify PowerShell launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scan.ps1 --version

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recons101x"
-version = "1.0.0"
+version = "1.0.5"
 description = "Portable passive hostname reconnaissance through Shodan CTL"
 readme = "README.md"
 requires-python = ">=3.10"

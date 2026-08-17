@@ -91,8 +91,64 @@ removed automatically.
 ```
 
 With `--resolve`, TXT output becomes
-`domain<TAB>hostname<TAB>ip1,ip2`. This option performs DNS lookups only. It
-does not scan ports or send requests to discovered hostnames.
+`domain<TAB>hostname<TAB>ip1,ip2`. Add `--status` to append the more precise
+state. `DNS_ONLY` means that the hostname resolves but no web service was
+verified; `TCP_REACHABLE` means that 443/80 accepted a connection;
+`HTTP_REACHABLE` means that HTTP/HTTPS returned a response; and `STALE` means
+that DNS did not resolve. Reachable states are shown in green in an
+interactive terminal. Without `--probe`, resolution only distinguishes
+`DNS_ONLY` and `STALE`.
+
+Because certificate transparency can contain old names, DNS activity is only a
+first filter. To verify that a web service is reachable, use the explicit
+probe and keep only active results:
+
+```sh
+./scan.sh example.com --probe --active-only --status --probe-timeout 3
+```
+
+`--probe` makes TCP and HTTP/HTTPS checks on ports 443 and 80 and records the
+reachable ports and HTTP status codes in JSON as `ports` and `http`. It is
+intentionally opt-in and should only be used on domains you own or are
+authorized to test. With `--probe`, `--active-only` removes `STALE` and
+`DNS_ONLY` names from the output; with `--resolve` alone it keeps names that
+resolve in DNS. Without the filter, the tool reports every state.
+
+When resolving or probing, stderr also prints a compact summary such as:
+
+```text
+[+] Summary: 312 DNS | 86 TCP | 54 HTTP | 936 stale
+```
+
+The JSON output contains the same counters in each domain's `summary` object,
+while retaining the complete hostname details unless `--active-only` is used.
+
+In an interactive terminal, status output uses a fixed-width table and
+truncates long hostnames or IPv6 lists so rows do not wrap. Redirected output
+and files keep the complete tab-separated values.
+
+For normal use, the concise equivalent is:
+
+```sh
+./scan.sh example.com --live
+```
+
+`--live` is the high-level mode: it resolves names, checks web reachability,
+keeps only active names, and displays their status. The individual switches
+remain available for automation and advanced tuning.
+
+## Certificate enrichment
+
+Use `--certificates` with JSON output to query all three Shodan CTL resources:
+
+```sh
+./scan.sh example.com --resolve --status --certificates --format json --output results.json
+```
+
+The JSON result keeps the existing `domain` and `hostnames` fields, adds an
+`active` boolean to each hostname when `--resolve` is used, and adds a
+`certificates` array containing each SHA-256 hash and its response from
+`/api/v1/cert/{sha256}`. The extra certificate requests are opt-in.
 
 ## Options
 
@@ -101,7 +157,8 @@ does not scan ports or send requests to discovered hostnames.
 ```
 
 Available controls include HTTP timeout, retry count, concurrent DNS workers,
-input files, output files, and TXT or JSON formatting.
+input files, output files, TXT or JSON formatting, active-node status, color
+control, and optional certificate enrichment.
 
 ## Project Structure
 

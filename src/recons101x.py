@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
+import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import re
 import socket
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,8 +44,8 @@ BANNER = r"""
 """
 
 
-def print_banner() -> None:
-    use_color = sys.stderr.isatty() and "NO_COLOR" not in os.environ
+def print_banner(no_color: bool = False) -> None:
+    use_color = not no_color and color_enabled(stream=sys.stderr)
     if os.name == "nt":
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8")
@@ -91,7 +96,7 @@ def fetch_json(url: str, timeout: float, retries: int) -> object:
             with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
                 payload = json.load(response)
             return payload
-        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
             last_error = exc
             if attempt < retries:
                 time.sleep(2**attempt)
@@ -173,7 +178,7 @@ def probe_http_services(hostname: str, ports: list[int], timeout: float) -> dict
         except urllib.error.HTTPError as exc:
             # An HTTP error still proves that an HTTP server answered.
             statuses[scheme] = exc.code
-        except (urllib.error.URLError, OSError, TimeoutError):
+        except (OSError, http.client.HTTPException):
             continue
     return statuses
 
@@ -224,6 +229,18 @@ def build_hostname_entry(
         entry["ports"] = ports
         entry["http"] = http
     return entry
+
+
+def check_hostname(hostname: str, resolve: bool, probe: bool, timeout: float) -> dict[str, object]:
+    ips = resolve_hostname(hostname) if resolve or probe else []
+    ports = probe_hostname(hostname, timeout) if probe and ips else []
+    http = probe_http_services(hostname, ports, timeout) if ports else {}
+    return build_hostname_entry(hostname, ips, ports, http, resolve, resolve, probe)
+
+
+def report_progress(label: str, completed: int, total: int, enabled: bool) -> None:
+    if enabled and (completed == 1 or completed == total or completed % 10 == 0):
+        print(f"[+] {label}: {completed}/{total}", file=sys.stderr, flush=True)
 
 
 def read_domains(values: Iterable[str], input_file: Path | None) -> list[str]:
@@ -351,7 +368,8 @@ def format_pretty(
     return "\n".join(lines) + "\n"
 
 
-def color_enabled(force: bool = False, stream: object = sys.stdout) -> bool:
+def color_enabled(force: bool = False, stream: object | None = None) -> bool:
+    stream = sys.stdout if stream is None else stream
     return bool(
         "NO_COLOR" not in os.environ
         and (force or (hasattr(stream, "isatty") and stream.isatty()))
@@ -373,7 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="show only hostnames with a reachable web service",
+        help="show only hostnames with TCP or HTTP reachability on ports 443/80",
     )
     parser.add_argument("--resolve", action="store_true", help="resolve A/AAAA records for each hostname")
     parser.add_argument(
@@ -399,7 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
     color = parser.add_mutually_exclusive_group()
     color.add_argument("--color", action="store_true", help="force color in text status output")
     color.add_argument("--no-color", action="store_true", help="disable ANSI colors")
-    parser.add_argument("--workers", type=int, default=10, help="concurrent DNS lookups (10)")
+    parser.add_argument("--workers", type=int, default=10, help="concurrent hostname checks (10)")
     parser.add_argument("--timeout", type=float, default=15, help="HTTP timeout in seconds (15)")
     parser.add_argument(
         "--probe-timeout",
@@ -408,6 +426,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="network timeout per probe in seconds (3)",
     )
     parser.add_argument("--retries", type=int, default=2, help="HTTP retries (2)")
+    parser.add_argument("--max-hosts", type=int, help="maximum hostnames per domain (default: all)")
+    parser.add_argument(
+        "--max-certificates", type=int,
+        help="maximum certificate details per domain (default: all; requires --certificates to fetch)",
+    )
+    parser.add_argument(
+        "--max-time", type=float,
+        help="maximum scan duration in seconds, including DNS and retries (default: unlimited)",
+    )
+    parser.add_argument("--progress", action="store_true", help="report completed checks on stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -423,10 +451,21 @@ def apply_mode(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    print_banner()
     args = apply_mode(build_parser().parse_args(argv))
-    if args.workers < 1 or args.timeout <= 0 or args.probe_timeout <= 0 or args.retries < 0:
-        print("error: workers must be >= 1, timeouts > 0, and retries >= 0", file=sys.stderr)
+    timeouts = [args.timeout, args.probe_timeout]
+    if args.max_time is not None:
+        timeouts.append(args.max_time)
+    if args.workers < 1 or args.retries < 0:
+        print("error: workers must be >= 1 and retries >= 0", file=sys.stderr)
+        return 2
+    if any(not math.isfinite(value) or not 0 < value <= threading.TIMEOUT_MAX for value in timeouts):
+        print(
+            f"error: timeouts must be finite and > 0, up to {threading.TIMEOUT_MAX:g} seconds",
+            file=sys.stderr,
+        )
+        return 2
+    if any(value is not None and value < 1 for value in (args.max_hosts, args.max_certificates)):
+        print("error: --max-hosts and --max-certificates must be >= 1", file=sys.stderr)
         return 2
     if args.status and not (args.resolve or args.probe):
         print("error: --status requires --resolve or --probe", file=sys.stderr)
@@ -441,6 +480,53 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    print_banner(args.no_color)
+    process = None
+    try:
+        if args.max_time is None:
+            return scan_domains(args, domains)
+        # A separate process can stop blocked system DNS calls and all worker threads.
+        process = multiprocessing.get_context("spawn").Process(
+            target=_scan_process, args=(args, domains)
+        )
+        process.start()
+        remaining = args.max_time
+        deadline = time.monotonic() + remaining
+        while True:
+            # Some platforms cannot represent very large process-wait timeouts.
+            process.join(timeout=min(remaining, 3600))
+            if not process.is_alive():
+                return process.exitcode or 0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"error: scan exceeded --max-time {args.max_time:g} seconds", file=sys.stderr)
+                return 1
+    except KeyboardInterrupt:
+        print("error: scan interrupted", file=sys.stderr)
+        return 130
+    finally:
+        if process is not None and process.is_alive():
+            process.kill()
+            process.join()
+
+
+def _watch_parent() -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        multiprocessing.connection.wait([parent.sentinel])
+        # Do not leave probes running if the supervisor is forcibly terminated.
+        os._exit(1)
+
+
+def _scan_process(args: argparse.Namespace, domains: list[str]) -> None:
+    threading.Thread(target=_watch_parent, daemon=True).start()
+    try:
+        raise SystemExit(scan_domains(args, domains))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
     results: list[dict[str, object]] = []
     failed = False
     for domain in domains:
@@ -452,53 +538,33 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             continue
 
-        ips_by_hostname: dict[str, list[str]] = {}
-        if (args.resolve or args.probe) and hostnames:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-                ips_by_hostname = dict(zip(hostnames, executor.map(resolve_hostname, hostnames)))
-
-        ports_by_hostname: dict[str, list[int]] = {}
-        if args.probe and hostnames:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-                ports_by_hostname = dict(
-                    zip(
-                        hostnames,
-                        executor.map(
-                            lambda hostname: probe_hostname(hostname, args.probe_timeout),
-                            hostnames,
-                        ),
-                    )
-                )
-
-        http_by_hostname: dict[str, dict[str, int]] = {}
-        if args.probe and hostnames:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-                http_by_hostname = dict(
-                    zip(
-                        hostnames,
-                        executor.map(
-                            lambda hostname: probe_http_services(
-                                hostname,
-                                ports_by_hostname.get(hostname, []),
-                                args.probe_timeout,
-                            ),
-                            hostnames,
-                        ),
-                    )
-                )
-
-        all_hostname_entries = [
-            build_hostname_entry(
-                hostname,
-                ips_by_hostname.get(hostname, []),
-                ports_by_hostname.get(hostname, []),
-                http_by_hostname.get(hostname, {}),
-                include_ips=args.resolve,
-                resolve=args.resolve,
-                probe=args.probe,
+        if args.max_hosts is not None and len(hostnames) > args.max_hosts:
+            print(
+                f"[!] Limiting {domain} to {args.max_hosts} of {len(hostnames)} hostnames",
+                file=sys.stderr,
             )
-            for hostname in hostnames
-        ]
+            hostnames = hostnames[:args.max_hosts]
+
+        if (args.resolve or args.probe) and hostnames:
+            entries_by_hostname = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(
+                        check_hostname, hostname, args.resolve, args.probe, args.probe_timeout
+                    ): hostname
+                    for hostname in hostnames
+                }
+                for completed, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                    entries_by_hostname[futures[future]] = future.result()
+                    report_progress(
+                        f"{domain} hostnames", completed, len(hostnames), args.progress
+                    )
+            all_hostname_entries = [entries_by_hostname[hostname] for hostname in hostnames]
+        else:
+            all_hostname_entries = [
+                build_hostname_entry(hostname, [], [], {}, args.resolve, args.resolve, args.probe)
+                for hostname in hostnames
+            ]
         summary = summarize_entries(all_hostname_entries)
         active_count = sum(1 for entry in all_hostname_entries if entry.get("active"))
         hostname_entries = (
@@ -513,8 +579,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.certificates:
             try:
                 certificate_hashes = fetch_certificate_hashes(domain, args.timeout, args.retries)
+                if args.max_certificates is not None and len(certificate_hashes) > args.max_certificates:
+                    print(
+                        f"[!] Limiting {domain} to {args.max_certificates} of "
+                        f"{len(certificate_hashes)} certificates",
+                        file=sys.stderr,
+                    )
+                    certificate_hashes = certificate_hashes[:args.max_certificates]
                 certificates = []
-                for certificate_hash in certificate_hashes:
+                for completed, certificate_hash in enumerate(certificate_hashes, 1):
                     try:
                         certificates.append(
                             {"sha256": certificate_hash, "data": fetch_certificate(certificate_hash, args.timeout, args.retries)}
@@ -522,6 +595,9 @@ def main(argv: list[str] | None = None) -> int:
                     except (RuntimeError, ValueError) as exc:
                         print(f"[!] Could not fetch certificate {certificate_hash}: {exc}", file=sys.stderr)
                         failed = True
+                    report_progress(
+                        f"{domain} certificates", completed, len(certificate_hashes), args.progress
+                    )
                 result["certificates"] = certificates
                 print(f"[+] Found {len(certificates)} related certificates", file=sys.stderr)
             except RuntimeError as exc:
@@ -534,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
             active_label = colorize(
                 f"{active_count} active",
                 "1;32",
-                color_enabled(args.color and not args.no_color, sys.stderr),
+                not args.no_color and color_enabled(args.color, sys.stderr),
             )
             filtered_label = (
                 f"; kept {len(hostname_entries)}"
@@ -561,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
             results,
             args.resolve,
             include_status=args.status,
-            color=(args.color or color_enabled(False)) and not args.no_color,
+            color=not args.no_color and color_enabled(args.color),
             pretty=(args.output is None and args.status and sys.stdout.isatty()),
             width=shutil.get_terminal_size(fallback=(120, 24)).columns,
         )

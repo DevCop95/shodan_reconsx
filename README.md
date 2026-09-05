@@ -6,11 +6,16 @@
 
 ![Recons101x blood-red banner](assets/shodanx.png)
 
-Recons101x is a portable passive reconnaissance tool that enumerates hostnames
+Recons101x is a portable, passive-by-default reconnaissance tool that enumerates hostnames
 published by `ctl.shodan.io`. It runs on Linux, Termux, and Windows using only
 Python 3. No Shodan API key or third-party packages are required.
 
 Use this tool only against assets you own or are explicitly authorized to test.
+The examples use `example.com` as a placeholder; replace it with an authorized domain.
+
+The latest GitHub release is [v1.0.5](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5)
+(2026-08-17). The limits, progress, and reliability changes below are
+[Unreleased](CHANGELOG.md#unreleased); the version remains `1.0.5`.
 
 ## Requirements
 
@@ -56,8 +61,10 @@ python src/recons101x.py example.com
 
 The TXT output contains `domain<TAB>hostname`. Status messages and the banner
 are written to stderr, keeping stdout safe for pipes and redirection.
-The banner uses ANSI bright red when stderr is an interactive terminal. Set the
-standard `NO_COLOR` environment variable to disable color.
+The banner uses ANSI bright red when stderr is an interactive terminal.
+`--no-color` disables color in the banner, summary, and text output. The standard
+`NO_COLOR` environment variable also disables color, overriding `--color`.
+`--help` and `--version` do not print a banner.
 
 ## Batch Scanning
 
@@ -94,14 +101,14 @@ With `--resolve`, TXT output becomes
 `domain<TAB>hostname<TAB>ip1,ip2`. Add `--status` to append the more precise
 state. `DNS_ONLY` means that the hostname resolves but no web service was
 verified; `TCP_REACHABLE` means that 443/80 accepted a connection;
-`HTTP_REACHABLE` means that HTTP/HTTPS returned a response; and `STALE` means
-that DNS did not resolve. Reachable states are shown in green in an
+`HTTP_REACHABLE` means that HTTP/HTTPS returned a response, including 4xx/5xx
+errors, not that the service is healthy; and `STALE` means that DNS did not
+resolve. Reachable states are shown in green in an
 interactive terminal. Without `--probe`, resolution only distinguishes
 `DNS_ONLY` and `STALE`.
 
 Because certificate transparency can contain old names, DNS activity is only a
-first filter. To verify that a web service is reachable, use the explicit
-probe and keep only active results:
+first filter. To check TCP and HTTP reachability and keep only active results:
 
 ```sh
 ./scan.sh example.com --probe --active-only --status --probe-timeout 3
@@ -114,41 +121,63 @@ authorized to test. With `--probe`, `--active-only` removes `STALE` and
 `DNS_ONLY` names from the output; with `--resolve` alone it keeps names that
 resolve in DNS. Without the filter, the tool reports every state.
 
-When resolving or probing, stderr also prints a compact summary such as:
-
-```text
-[+] Summary: 312 DNS | 86 TCP | 54 HTTP | 936 stale
-```
-
-The JSON output contains the same counters in each domain's `summary` object,
-while retaining the complete hostname details unless `--active-only` is used.
+When resolving or probing, stderr prints DNS/TCP/HTTP/stale counters, also
+included in each domain's JSON `summary` object. These cover only the hostnames
+selected by `--max-hosts`, before `--active-only` filtering, not the full CTL
+inventory when capped. JSON retains selected hostname details unless filtered.
 
 In an interactive terminal, status output uses a fixed-width table and
 truncates long hostnames or IPv6 lists so rows do not wrap. Redirected output
 and files keep the complete tab-separated values.
 
-For normal use, the concise equivalent is:
+For a bounded live scan:
 
 ```sh
-./scan.sh example.com --live
+./scan.sh example.com --live --max-hosts 50 --max-time 60 --progress
 ```
 
-`--live` is the high-level mode: it resolves names, checks web reachability,
-keeps only active names, and displays their status. The individual switches
-remain available for automation and advanced tuning.
+`--live` (two hyphens) enables `--resolve --probe --active-only --status`.
+It is opt-in active traffic, not passive enumeration. TCP reachability alone
+is sufficient to keep a hostname; an HTTP response is not required. The
+individual switches remain available for automation and advanced tuning.
 
 ## Certificate enrichment
 
-Use `--certificates` with JSON output to query all three Shodan CTL resources:
+For bounded passive certificate enrichment (CTL requests only, no target probes):
 
 ```sh
-./scan.sh example.com --resolve --status --certificates --format json --output results.json
+./scan.sh example.com --certificates --max-certificates 5 --max-time 60 --progress --format json --output results.json
 ```
 
 The JSON result keeps the existing `domain` and `hostnames` fields, adds an
 `active` boolean to each hostname when `--resolve` is used, and adds a
 `certificates` array containing each SHA-256 hash and its response from
-`/api/v1/cert/{sha256}`. The extra certificate requests are opt-in.
+`/api/v1/cert/{sha256}`. Fetching requires `--certificates`; a limit alone does
+not enable it. Use `--format json` to display certificate data: TXT output does
+not include it, even though `--certificates` still performs the requests.
+
+## Limits and Progress
+
+Limits are optional; scans remain unlimited unless a limit is supplied.
+
+| Option | Scope |
+| --- | --- |
+| `--max-hosts N` | Positive integer, per domain in all modes, including passive. Selects the first N sorted unique names after the full CTL hostname index fetch; does not limit that query. |
+| `--max-certificates N` | Positive integer, per domain. Limits certificate detail downloads after the full certificate index query, selecting the first N sorted SHA-256 hashes, not the newest certificates. |
+| `--max-time SECONDS` | Overall scan deadline across all domains, CTL queries, DNS, TCP, HTTP, retries, and certificate requests. |
+| `--progress` | Off by default. Reports the first, every tenth, and final completed hostname check or certificate detail request per domain, including failures, to stderr only. |
+
+Progress does not contaminate stdout and is not a heartbeat during index queries
+or stalled work. Passive enumeration without certificate enrichment has no
+hostname checks to report.
+
+`--max-time` runs the scan in a separate spawned process, terminated on expiry
+even if DNS is stuck. The worker also exits if its supervisor is terminated.
+Arguments and input are validated before timing; process
+startup and cleanup can add minor overhead. A deadline returns exit code `1`.
+Regular output is produced at the end; results in progress are not checkpointed,
+and unfinished scan output is not guaranteed. Do not treat a previous or existing
+output file as a new successful result after a timeout.
 
 ## Options
 
@@ -156,9 +185,20 @@ The JSON result keeps the existing `domain` and `hostnames` fields, adds an
 ./scan.sh --help
 ```
 
-Available controls include HTTP timeout, retry count, concurrent DNS workers,
-input files, output files, TXT or JSON formatting, active-node status, color
-control, and optional certificate enrichment.
+- `--workers` (default `10`) bounds combined per-host DNS -> TCP -> HTTP workers.
+  HTTP checks need not wait for all DNS lookups; DNS-failed names skip probes.
+  Result ordering is unchanged.
+- `--timeout` (default `15` seconds) applies per CTL network operation;
+  `--probe-timeout` (default `3` seconds) applies per probe. Neither is an overall
+  DNS deadline; use `--max-time` for that. All three timeout options require
+  positive finite seconds within the platform's supported range; NaN and infinity
+  are rejected.
+- `--retries` (default `2`) controls CTL retries. Network `HTTPException`
+  (including `IncompleteRead`) and `OSError` failures are retried or reported
+  as controlled query errors; malformed HTTP probe responses are ignored.
+
+Exit codes: `0` success; `1` query, output-write, or deadline error; `2` invalid
+arguments/input; `130` interrupt. Check the exit code before consuming results.
 
 ## Project Structure
 

@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Optional per-domain `--max-hosts` and `--max-certificates` limits; defaults remain unlimited.
+- Opt-in `--progress` for completed hostname checks and certificate requests on stderr.
+- Overall `--max-time` deadline, including blocked DNS, with worker cleanup on timeout or supervisor termination.
+
+### Fixed
+
+- Pipeline DNS/TCP/HTTP checks per hostname, skipping probes when DNS fails and preserving result order.
+- Retry or report incomplete CTL responses and transport failures; ignore malformed HTTP probe responses.
+- Reject nonpositive, nonfinite, or unsupported timeout values.
+- Honor `--no-color` for the banner, summary, and text output, and let `NO_COLOR` override `--color`.
+- Suppress the banner for `--help` and `--version`.
+
 ## [1.0.5] - 2026-08-17
 
 ### Added
@@ -24,5 +40,6 @@ All notable changes to this project are documented here.
 - Domain validation, retries, timeout controls, and IDN support.
 - Cross-platform tests and automated GitHub releases.
 
+[Unreleased]: https://github.com/DevCop95/shodan_reconsx/compare/v1.0.5...HEAD
 [1.0.0]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.0
 [1.0.5]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5

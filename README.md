@@ -13,9 +13,9 @@ Python 3. No Shodan API key or third-party packages are required.
 Use this tool only against assets you own or are explicitly authorized to test.
 The examples use `example.com` as a placeholder; replace it with an authorized domain.
 
-The latest GitHub release is [v1.0.5](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5)
-(2026-08-17). The limits, progress, and reliability changes below are
-[Unreleased](CHANGELOG.md#unreleased); the version remains `1.0.5`.
+The latest published GitHub release is [v1.0.5](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5)
+(2026-08-17). The working tree prepares version `1.1.0`; publish it by pushing
+the `v1.1.0` tag after review.
 
 ## Requirements
 
@@ -66,6 +66,14 @@ The banner uses ANSI bright red when stderr is an interactive terminal.
 `NO_COLOR` environment variable also disables color, overriding `--color`.
 `--help` and `--version` do not print a banner.
 
+The shell launchers accept `RECONS101X_PYTHON` to select a specific Python
+executable. This is useful when Git Bash finds a Windows Store `python3` alias
+before the Python installation you intend to use:
+
+```sh
+RECONS101X_PYTHON=/usr/bin/python3 ./scan.sh example.com
+```
+
 ## Batch Scanning
 
 Create a `domains.txt` file:
@@ -103,7 +111,8 @@ state. `DNS_ONLY` means that the hostname resolves but no web service was
 verified; `TCP_REACHABLE` means that 443/80 accepted a connection;
 `HTTP_REACHABLE` means that HTTP/HTTPS returned a response, including 4xx/5xx
 errors, not that the service is healthy; and `STALE` means that DNS did not
-resolve. Reachable states are shown in green in an
+resolve. The current state model does not distinguish NXDOMAIN from resolver
+timeouts. Reachable states are shown in green in an
 interactive terminal. Without `--probe`, resolution only distinguishes
 `DNS_ONLY` and `STALE`.
 
@@ -117,7 +126,9 @@ first filter. To check TCP and HTTP reachability and keep only active results:
 `--probe` makes TCP and HTTP/HTTPS checks on ports 443 and 80 and records the
 reachable ports and HTTP status codes in JSON as `ports` and `http`. It is
 intentionally opt-in and should only be used on domains you own or are
-authorized to test. With `--probe`, `--active-only` removes `STALE` and
+authorized to test. Hostnames returned by CTL must be valid names within the
+requested domain. HTTP checks do not follow redirects, keeping requests within
+the selected hostname. With `--probe`, `--active-only` removes `STALE` and
 `DNS_ONLY` names from the output; with `--resolve` alone it keeps names that
 resolve in DNS. Without the filter, the tool reports every state.
 
@@ -152,9 +163,13 @@ For bounded passive certificate enrichment (CTL requests only, no target probes)
 The JSON result keeps the existing `domain` and `hostnames` fields, adds an
 `active` boolean to each hostname when `--resolve` is used, and adds a
 `certificates` array containing each SHA-256 hash and its response from
-`/api/v1/cert/{sha256}`. Fetching requires `--certificates`; a limit alone does
-not enable it. Use `--format json` to display certificate data: TXT output does
-not include it, even though `--certificates` still performs the requests.
+`/api/v1/cert/{sha256}`. It also includes `source`, `queried_at`, `complete`,
+`errors`, and per-stage `timings`. A partial result is marked incomplete and
+the process exits nonzero; always check the exit code before consuming output.
+Fetching requires `--certificates`; a limit alone does not enable it. Use
+`--format json` to display certificate data: TXT output does not include it,
+even though `--certificates` still performs the requests. Certificate details
+are fetched concurrently, in stable hash order, using `--certificate-workers`.
 
 ## Limits and Progress
 
@@ -165,7 +180,7 @@ Limits are optional; scans remain unlimited unless a limit is supplied.
 | `--max-hosts N` | Positive integer, per domain in all modes, including passive. Selects the first N sorted unique names after the full CTL hostname index fetch; does not limit that query. |
 | `--max-certificates N` | Positive integer, per domain. Limits certificate detail downloads after the full certificate index query, selecting the first N sorted SHA-256 hashes, not the newest certificates. |
 | `--max-time SECONDS` | Overall scan deadline across all domains, CTL queries, DNS, TCP, HTTP, retries, and certificate requests. |
-| `--progress` | Off by default. Reports the first, every tenth, and final completed hostname check or certificate detail request per domain, including failures, to stderr only. |
+| `--progress` | Off by default. Reports CTL index request and duration, then the first, every tenth, and final completed hostname check or certificate detail request per domain, including failures, to stderr only. |
 
 Progress does not contaminate stdout and is not a heartbeat during index queries
 or stalled work. Passive enumeration without certificate enrichment has no
@@ -188,14 +203,23 @@ output file as a new successful result after a timeout.
 - `--workers` (default `10`) bounds combined per-host DNS -> TCP -> HTTP workers.
   HTTP checks need not wait for all DNS lookups; DNS-failed names skip probes.
   Result ordering is unchanged.
+- `--certificate-workers` (default `4`) bounds concurrent certificate detail
+  requests. It does not affect hostname checks or the certificate index query.
 - `--timeout` (default `15` seconds) applies per CTL network operation;
   `--probe-timeout` (default `3` seconds) applies per probe. Neither is an overall
   DNS deadline; use `--max-time` for that. All three timeout options require
   positive finite seconds within the platform's supported range; NaN and infinity
   are rejected.
-- `--retries` (default `2`) controls CTL retries. Network `HTTPException`
-  (including `IncompleteRead`) and `OSError` failures are retried or reported
-  as controlled query errors; malformed HTTP probe responses are ignored.
+- `--retries` (default `2`) controls CTL retries. Transient transport failures,
+  HTTP 408/425/429, and HTTP 5xx responses are retried with bounded backoff;
+  `Retry-After` is honored up to 60 seconds. Other HTTP 4xx responses fail
+  immediately. Malformed HTTP probe responses are ignored.
+
+Output files are replaced atomically after serialization completes. A scan with
+per-domain errors still writes a JSON result with `complete: false` and an
+`errors` list, then returns a nonzero exit code. A deadline can still terminate
+the worker before final serialization, so it does not guarantee a new output
+file.
 
 Exit codes: `0` success; `1` query, output-write, or deadline error; `2` invalid
 arguments/input; `130` interrupt. Check the exit code before consuming results.

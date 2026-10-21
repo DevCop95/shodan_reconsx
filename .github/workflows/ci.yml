@@ -42,8 +42,12 @@ jobs:
             python: "3.10"
           - os: ubuntu-latest
             python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
           - os: windows-latest
             python: "3.12"
+          - os: windows-latest
+            python: "3.14"
           - os: macos-latest
             python: "3.12"
 
@@ -71,6 +75,12 @@ jobs:
       - name: Verify shell launcher
         if: runner.os == 'Linux'
         run: bash -n scan.sh && bash scan.sh --version
+
+      - name: Verify Git Bash launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & 'C:\Program Files\Git\bin\bash.exe' -c 'bash -n scan.sh && ./scan.sh --version'
 
       - name: Verify PowerShell launcher
         if: runner.os == 'Windows'

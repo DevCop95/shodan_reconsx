@@ -44,7 +44,7 @@ def quick_scan_process(args, domains):
 
 class DomainTests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(recons101x.__version__, "1.0.5")
+        self.assertEqual(recons101x.__version__, "1.1.0")
 
     def test_normalizes_domain(self):
         self.assertEqual(recons101x.normalize_domain(" Example.COM. "), "example.com")
@@ -78,6 +78,27 @@ class DomainTests(unittest.TestCase):
             recons101x.fetch_hostnames("example.com", timeout=1, retries=0),
             ["example.com", "www.example.com"],
         )
+
+    @mock.patch("recons101x.urllib.request.urlopen")
+    def test_rejects_hostnames_outside_requested_scope(self, urlopen):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            ["www.example.com", "notexample.com"]
+        ).encode()
+        urlopen.return_value = response
+        with self.assertRaisesRegex(RuntimeError, "outside example.com"):
+            recons101x.fetch_hostnames("example.com", timeout=1, retries=0)
+
+    def test_atomic_output_preserves_old_file_if_replacement_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text("old", encoding="utf-8")
+            with mock.patch("recons101x.os.replace", side_effect=OSError("disk error")):
+                with self.assertRaisesRegex(OSError, "disk error"):
+                    recons101x.write_output_atomic(path, "new")
+            self.assertEqual(path.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
     def test_formats_text_with_ips(self):
         results = [
@@ -186,6 +207,7 @@ class NetworkIsolatedTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         for target in (
             "recons101x.urllib.request.urlopen",
+            "recons101x.urllib.request.build_opener",
             "recons101x.socket.getaddrinfo",
             "recons101x.socket.create_connection",
         ):
@@ -207,7 +229,8 @@ class ReliabilityTests(NetworkIsolatedTests):
                 response.__enter__.return_value = response
                 response.read.side_effect = [error, b'{"ok": true}']
                 with mock.patch("recons101x.urllib.request.urlopen", return_value=response) as open_url, \
-                        mock.patch("recons101x.time.sleep") as sleep:
+                        mock.patch("recons101x.time.sleep") as sleep, \
+                        mock.patch("recons101x.random.uniform", return_value=0):
                     self.assertEqual(
                         recons101x.fetch_json("https://example.com/", timeout=1, retries=1),
                         {"ok": True},
@@ -226,7 +249,8 @@ class ReliabilityTests(NetworkIsolatedTests):
             for retries in (0, 2):
                 with self.subTest(error=type(error).__name__, retries=retries), \
                         mock.patch("recons101x.urllib.request.urlopen", side_effect=error) as open_url, \
-                        mock.patch("recons101x.time.sleep") as sleep:
+                        mock.patch("recons101x.time.sleep") as sleep, \
+                        mock.patch("recons101x.random.uniform", return_value=0):
                     with self.assertRaisesRegex(RuntimeError, "could not query"):
                         recons101x.fetch_json("https://example.com/", timeout=1, retries=retries)
                     self.assertEqual(open_url.call_count, retries + 1)
@@ -234,15 +258,65 @@ class ReliabilityTests(NetworkIsolatedTests):
 
     def test_http_protocol_failures_are_ignored_but_http_error_status_is_kept(self):
         for error in (http.client.HTTPException("bad response"), http.client.IncompleteRead(b"", 1)):
+            opener = mock.Mock()
+            opener.open.side_effect = [
+                error,
+                urllib.error.HTTPError("http://example.com/", 503, "busy", {}, None),
+            ]
             with self.subTest(error=type(error).__name__), mock.patch(
-                "recons101x.urllib.request.urlopen",
-                side_effect=[error, urllib.error.HTTPError("http://example.com/", 503, "busy", {}, None)],
-            ) as open_url:
+                "recons101x.urllib.request.build_opener", return_value=opener
+            ) as build_opener:
                 self.assertEqual(
                     recons101x.probe_http_services("example.com", [443, 80], timeout=1),
                     {"http": 503},
                 )
-                self.assertEqual(open_url.call_count, 2)
+                self.assertEqual(build_opener.call_count, 2)
+                self.assertEqual(opener.open.call_count, 2)
+
+    def test_probe_http_does_not_follow_redirects(self):
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "https://example.com/", 302, "Found", {"Location": "http://127.0.0.1/"}, None
+        )
+        with mock.patch("recons101x.urllib.request.build_opener", return_value=opener) as build_opener:
+            self.assertEqual(
+                recons101x.probe_http_services("example.com", [443], timeout=1),
+                {"https": 302},
+            )
+        build_opener.assert_called_once_with(recons101x.NoRedirectHandler)
+        opener.open.assert_called_once()
+
+    def test_http_404_is_not_retried_but_503_is(self):
+        not_found = urllib.error.HTTPError("https://ctl.shodan.io/", 404, "missing", {}, None)
+        with mock.patch("recons101x.urllib.request.urlopen", side_effect=not_found) as open_url, \
+                mock.patch("recons101x.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "could not query"):
+                recons101x.fetch_json("https://ctl.shodan.io/", timeout=1, retries=3)
+        open_url.assert_called_once()
+        sleep.assert_not_called()
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        busy = urllib.error.HTTPError("https://ctl.shodan.io/", 503, "busy", {}, None)
+        with mock.patch("recons101x.urllib.request.urlopen", side_effect=[busy, response]) as open_url, \
+                mock.patch("recons101x.time.sleep") as sleep, \
+                mock.patch("recons101x.random.uniform", return_value=0):
+            self.assertEqual(recons101x.fetch_json("https://ctl.shodan.io/", timeout=1, retries=1), {"ok": True})
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_retry_after_is_honored_for_rate_limit(self):
+        rate_limited = urllib.error.HTTPError(
+            "https://ctl.shodan.io/", 429, "rate limited", {"Retry-After": "3"}, None
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        with mock.patch("recons101x.urllib.request.urlopen", side_effect=[rate_limited, response]), \
+                mock.patch("recons101x.time.sleep") as sleep:
+            self.assertEqual(recons101x.fetch_json("https://ctl.shodan.io/", timeout=1, retries=1), {"ok": True})
+        sleep.assert_called_once_with(3.0)
 
     def test_check_hostname_runs_only_applicable_stages_in_order(self):
         cases = (
@@ -309,6 +383,7 @@ class ScanTests(NetworkIsolatedTests):
         self.assertIsNone(args.max_certificates)
         self.assertIsNone(args.max_time)
         self.assertFalse(args.progress)
+        self.assertEqual(args.certificate_workers, 4)
 
     def test_invalid_timeouts_are_rejected_before_network(self):
         for option in ("--timeout", "--probe-timeout", "--max-time"):
@@ -332,6 +407,13 @@ class ScanTests(NetworkIsolatedTests):
                     self.fetch_hostnames.assert_not_called()
                     self.fetch_certificate_hashes.assert_not_called()
 
+    def test_nonpositive_worker_counts_are_rejected_before_network(self):
+        for option in ("--workers", "--certificate-workers"):
+            with self.subTest(option=option):
+                self.fetch_hostnames.reset_mock()
+                self.assertEqual(recons101x.main(["example.com", option, "0"]), 2)
+                self.fetch_hostnames.assert_not_called()
+
     def test_help_and_version_exit_without_banner(self):
         for option in ("--help", "--version"):
             with self.subTest(option=option), mock.patch.object(recons101x, "print_banner") as banner:
@@ -340,7 +422,7 @@ class ScanTests(NetworkIsolatedTests):
                 self.assertEqual(raised.exception.code, 0)
                 banner.assert_not_called()
                 self.fetch_hostnames.assert_not_called()
-        self.assertIn("1.0.5", self.stdout.getvalue())
+        self.assertIn("1.1.0", self.stdout.getvalue())
 
     def test_no_color_suppresses_all_ansi_on_ttys(self):
         for options, env in ((["--no-color"], {}), (["--color"], {"NO_COLOR": ""})):
@@ -430,18 +512,34 @@ class ScanTests(NetworkIsolatedTests):
         ]), 0)
         result = json.loads(self.stdout.getvalue())[0]
         self.assertEqual([item["sha256"] for item in result["certificates"]], self.hashes[:2])
-        self.assertEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes[:2])
+        self.assertCountEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes[:2])
         self.assertRegex(self.stderr.getvalue().lower(), r"(?m).*cert.*(?:limit|truncat)|.*(?:limit|truncat).*cert")
 
     def test_certificates_remain_unlimited_and_txt_behavior_is_unchanged(self):
         self.assertEqual(recons101x.main(["example.com", "--certificates", "--format", "txt"]), 0)
-        self.assertEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes)
+        self.assertCountEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes)
         self.assertEqual(self.stdout.getvalue(), "".join(f"example.com\t{host}\n" for host in self.hostnames))
 
     def test_certificate_cap_does_not_enable_certificate_queries(self):
         self.assertEqual(recons101x.main(["example.com", "--max-certificates", "1"]), 0)
         self.fetch_certificate_hashes.assert_not_called()
         self.fetch_certificate.assert_not_called()
+
+    def test_json_records_provenance_timings_and_partial_certificate_errors(self):
+        self.fetch_certificate_hashes.side_effect = RuntimeError("read timed out")
+        result_code = recons101x.main([
+            "example.com", "--certificates", "--progress", "--format", "json",
+        ])
+        self.assertEqual(result_code, 1)
+        result = json.loads(self.stdout.getvalue())[0]
+        self.assertEqual(result["source"], "Shodan CTL")
+        self.assertTrue(result["queried_at"].endswith("Z"))
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["certificates"], [])
+        self.assertIn("certificate index: read timed out", result["errors"][0])
+        self.assertIn("hostname_index_seconds", result["timings"])
+        self.assertIn("certificate_stage_seconds", result["timings"])
+        self.assertIn("CTL certificate index: requesting", self.stderr.getvalue())
 
     def test_progress_reports_first_every_tenth_and_final_completion_only_on_stderr(self):
         self.fetch_hostnames.return_value = [f"h{i}.example.com" for i in range(12)]

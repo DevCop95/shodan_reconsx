@@ -4,19 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-20
+
 ### Added
 
-- Optional per-domain `--max-hosts` and `--max-certificates` limits; defaults remain unlimited.
-- Opt-in `--progress` for completed hostname checks and certificate requests on stderr.
-- Overall `--max-time` deadline, including blocked DNS, with worker cleanup on timeout or supervisor termination.
+- Per-domain JSON provenance, completion/error state, and phase timings.
+- Concurrent certificate detail downloads controlled by `--certificate-workers`.
+- Progress for CTL index lookups, including elapsed time.
+- `RECONS101X_PYTHON` override in shell launchers.
 
 ### Fixed
 
-- Pipeline DNS/TCP/HTTP checks per hostname, skipping probes when DNS fails and preserving result order.
-- Retry or report incomplete CTL responses and transport failures; ignore malformed HTTP probe responses.
-- Reject nonpositive, nonfinite, or unsupported timeout values.
-- Honor `--no-color` for the banner, summary, and text output, and let `NO_COLOR` override `--color`.
-- Suppress the banner for `--help` and `--version`.
+- Validate CTL hostnames against the requested domain before any DNS or active checks.
+- Prevent HTTP probes from following redirects outside the selected hostname.
+- Retry only transient HTTP statuses, honor `Retry-After`, and use bounded jittered backoff.
+- Replace output files atomically after serialization.
+- Preserve partial domain results with explicit errors and a nonzero exit status.
 
 ## [1.0.5] - 2026-08-17
 
@@ -40,6 +43,7 @@ All notable changes to this project are documented here.
 - Domain validation, retries, timeout controls, and IDN support.
 - Cross-platform tests and automated GitHub releases.
 
-[Unreleased]: https://github.com/DevCop95/shodan_reconsx/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/DevCop95/shodan_reconsx/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/DevCop95/shodan_reconsx/compare/v1.0.5...v1.1.0
 [1.0.0]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.0
 [1.0.5]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5

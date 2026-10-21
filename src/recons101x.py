@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime as dt
 import http.client
 import json
 import math
 import multiprocessing
 import multiprocessing.connection
 import os
+import random
 import re
 import socket
 import shutil
@@ -27,7 +29,7 @@ DOMAIN_API_URL = "https://ctl.shodan.io/api/v1/domain/{domain}"
 HOSTNAMES_API_URL = "https://ctl.shodan.io/api/v1/domain/{domain}/hostnames"
 CERT_API_URL = "https://ctl.shodan.io/api/v1/cert/{sha256}"
 API_URL = HOSTNAMES_API_URL  # Backwards-compatible name for integrations.
-__version__ = "1.0.5"
+__version__ = "1.1.0"
 LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 BANNER = r"""
@@ -73,20 +75,61 @@ def normalize_domain(value: str) -> str:
     return domain
 
 
+def normalize_hostname(value: str, domain: str) -> str:
+    """Validate and normalize a hostname returned for a requested domain."""
+    try:
+        hostname = normalize_domain(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid hostname returned by CTL: {value!r}") from exc
+    if hostname != domain and not hostname.endswith(f".{domain}"):
+        raise ValueError(f"hostname returned outside {domain}: {value!r}")
+    return hostname
+
+
 def fetch_hostnames(domain: str, timeout: float, retries: int) -> list[str]:
     payload = fetch_json(
         HOSTNAMES_API_URL.format(domain=domain), timeout=timeout, retries=retries
     )
     if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
         raise RuntimeError(f"could not query {domain}: unexpected API response")
-    return sorted(set(payload))
+    try:
+        hostnames = {normalize_hostname(item, domain) for item in payload}
+    except ValueError as exc:
+        raise RuntimeError(f"could not query {domain}: {exc}") from exc
+    return sorted(hostnames)
+
+
+def retry_delay(error: Exception, attempt: int) -> float:
+    """Return a bounded retry delay, honoring numeric Retry-After values."""
+    if isinstance(error, urllib.error.HTTPError):
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        if retry_after:
+            try:
+                return min(60.0, max(0.0, float(retry_after)))
+            except ValueError:
+                try:
+                    retry_at = dt.datetime.strptime(
+                        retry_after, "%a, %d %b %Y %H:%M:%S GMT"
+                    ).replace(tzinfo=dt.timezone.utc)
+                    return min(
+                        60.0,
+                        max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds()),
+                    )
+                except ValueError:
+                    pass
+    base = min(float(2**attempt), 30.0)
+    return base + random.uniform(0.0, min(1.0, base * 0.1))
+
+
+def retryable_http_error(error: urllib.error.HTTPError) -> bool:
+    return error.code in {408, 425, 429} or 500 <= error.code <= 599
 
 
 def fetch_json(url: str, timeout: float, retries: int) -> object:
     """Fetch and decode one CTL JSON response with the same retry policy."""
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "shodan-domain-recon/1.0.5"},
+        headers={"Accept": "application/json", "User-Agent": f"shodan-domain-recon/{__version__}"},
     )
     last_error: Exception | None = None
 
@@ -96,10 +139,18 @@ def fetch_json(url: str, timeout: float, retries: int) -> object:
             with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
                 payload = json.load(response)
             return payload
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            should_retry = attempt < retries and retryable_http_error(exc)
+            delay = retry_delay(exc, attempt) if should_retry else 0.0
+            exc.close()
+            if not should_retry:
+                break
+            time.sleep(delay)
         except (OSError, http.client.HTTPException, ValueError) as exc:
             last_error = exc
             if attempt < retries:
-                time.sleep(2**attempt)
+                time.sleep(retry_delay(exc, attempt))
 
     raise RuntimeError(f"could not query {url}: {last_error}")
 
@@ -170,17 +221,25 @@ def probe_http_services(hostname: str, ports: list[int], timeout: float) -> dict
         request = urllib.request.Request(
             f"{scheme}://{hostname}/",
             method="HEAD",
-            headers={"User-Agent": "shodan-domain-recon/1.0.5"},
+            headers={"User-Agent": f"shodan-domain-recon/{__version__}"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            # Do not follow redirects: the destination may be outside the authorized scope.
+            opener = urllib.request.build_opener(NoRedirectHandler)
+            with opener.open(request, timeout=timeout) as response:  # nosec B310
                 statuses[scheme] = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
             # An HTTP error still proves that an HTTP server answered.
             statuses[scheme] = exc.code
+            exc.close()
         except (OSError, http.client.HTTPException):
             continue
     return statuses
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def classify_state(ips: list[str], ports: list[int], http: dict[str, int]) -> str:
@@ -380,6 +439,23 @@ def colorize(text: str, code: str, enabled: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if enabled else text
 
 
+def write_output_atomic(path: Path, content: str) -> None:
+    """Replace an output file only after its complete contents are written."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def utc_timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Enumerate hostnames for one or more domains through Shodan CTL."
@@ -418,6 +494,10 @@ def build_parser() -> argparse.ArgumentParser:
     color.add_argument("--color", action="store_true", help="force color in text status output")
     color.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     parser.add_argument("--workers", type=int, default=10, help="concurrent hostname checks (10)")
+    parser.add_argument(
+        "--certificate-workers", type=int, default=4,
+        help="concurrent certificate detail requests (4)",
+    )
     parser.add_argument("--timeout", type=float, default=15, help="HTTP timeout in seconds (15)")
     parser.add_argument(
         "--probe-timeout",
@@ -455,8 +535,11 @@ def main(argv: list[str] | None = None) -> int:
     timeouts = [args.timeout, args.probe_timeout]
     if args.max_time is not None:
         timeouts.append(args.max_time)
-    if args.workers < 1 or args.retries < 0:
-        print("error: workers must be >= 1 and retries >= 0", file=sys.stderr)
+    if args.workers < 1 or args.certificate_workers < 1 or args.retries < 0:
+        print(
+            "error: workers and certificate-workers must be >= 1 and retries >= 0",
+            file=sys.stderr,
+        )
         return 2
     if any(not math.isfinite(value) or not 0 < value <= threading.TIMEOUT_MAX for value in timeouts):
         print(
@@ -530,13 +613,46 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
     results: list[dict[str, object]] = []
     failed = False
     for domain in domains:
+        domain_started = time.monotonic()
+        errors: list[str] = []
+        timings: dict[str, float] = {}
         print(f"[+] Querying {domain}", file=sys.stderr)
+        if args.progress:
+            print(f"[+] {domain} CTL hostname index: requesting", file=sys.stderr, flush=True)
+        hostname_query_started = time.monotonic()
         try:
             hostnames = fetch_hostnames(domain, args.timeout, args.retries)
         except RuntimeError as exc:
             print(f"[-] {exc}", file=sys.stderr)
             failed = True
+            errors.append(str(exc))
+            timings["hostname_index_seconds"] = round(time.monotonic() - hostname_query_started, 3)
+            if args.progress:
+                print(
+                    f"[!] {domain} CTL hostname index failed after "
+                    f"{timings['hostname_index_seconds']:.3f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            timings["total_seconds"] = round(time.monotonic() - domain_started, 3)
+            results.append({
+                "domain": domain,
+                "source": "Shodan CTL",
+                "queried_at": utc_timestamp(),
+                "complete": False,
+                "errors": errors,
+                "timings": timings,
+                "hostnames": [],
+            })
             continue
+        timings["hostname_index_seconds"] = round(time.monotonic() - hostname_query_started, 3)
+        if args.progress:
+            print(
+                f"[+] {domain} CTL hostname index: {len(hostnames)} names in "
+                f"{timings['hostname_index_seconds']:.3f}s",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if args.max_hosts is not None and len(hostnames) > args.max_hosts:
             print(
@@ -545,6 +661,7 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
             )
             hostnames = hostnames[:args.max_hosts]
 
+        hostname_checks_started = time.monotonic()
         if (args.resolve or args.probe) and hostnames:
             entries_by_hostname = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -565,6 +682,7 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
                 build_hostname_entry(hostname, [], [], {}, args.resolve, args.resolve, args.probe)
                 for hostname in hostnames
             ]
+        timings["hostname_checks_seconds"] = round(time.monotonic() - hostname_checks_started, 3)
         summary = summarize_entries(all_hostname_entries)
         active_count = sum(1 for entry in all_hostname_entries if entry.get("active"))
         hostname_entries = (
@@ -572,13 +690,31 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
             if args.active_only
             else all_hostname_entries
         )
-        result: dict[str, object] = {"domain": domain, "hostnames": hostname_entries}
+        result: dict[str, object] = {
+            "domain": domain,
+            "source": "Shodan CTL",
+            "queried_at": utc_timestamp(),
+            "complete": True,
+            "errors": errors,
+            "timings": timings,
+            "hostnames": hostname_entries,
+        }
         if args.resolve or args.probe:
             result["summary"] = summary
 
         if args.certificates:
+            certificate_started = time.monotonic()
+            if args.progress:
+                print(f"[+] {domain} CTL certificate index: requesting", file=sys.stderr, flush=True)
             try:
                 certificate_hashes = fetch_certificate_hashes(domain, args.timeout, args.retries)
+                if args.progress:
+                    print(
+                        f"[+] {domain} CTL certificate index: {len(certificate_hashes)} hashes in "
+                        f"{time.monotonic() - certificate_started:.3f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 if args.max_certificates is not None and len(certificate_hashes) > args.max_certificates:
                     print(
                         f"[!] Limiting {domain} to {args.max_certificates} of "
@@ -586,25 +722,55 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
                         file=sys.stderr,
                     )
                     certificate_hashes = certificate_hashes[:args.max_certificates]
-                certificates = []
-                for completed, certificate_hash in enumerate(certificate_hashes, 1):
-                    try:
-                        certificates.append(
-                            {"sha256": certificate_hash, "data": fetch_certificate(certificate_hash, args.timeout, args.retries)}
-                        )
-                    except (RuntimeError, ValueError) as exc:
-                        print(f"[!] Could not fetch certificate {certificate_hash}: {exc}", file=sys.stderr)
-                        failed = True
-                    report_progress(
-                        f"{domain} certificates", completed, len(certificate_hashes), args.progress
-                    )
+                certificate_data: dict[str, object] = {}
+                if certificate_hashes:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(args.certificate_workers, len(certificate_hashes))
+                    ) as executor:
+                        futures = {
+                            executor.submit(
+                                fetch_certificate, certificate_hash, args.timeout, args.retries
+                            ): certificate_hash
+                            for certificate_hash in certificate_hashes
+                        }
+                        for completed, future in enumerate(
+                            concurrent.futures.as_completed(futures), 1
+                        ):
+                            certificate_hash = futures[future]
+                            try:
+                                certificate_data[certificate_hash] = future.result()
+                            except (RuntimeError, ValueError) as exc:
+                                message = f"certificate {certificate_hash}: {exc}"
+                                print(f"[!] Could not fetch {message}", file=sys.stderr)
+                                errors.append(message)
+                                failed = True
+                            report_progress(
+                                f"{domain} certificates", completed, len(certificate_hashes), args.progress
+                            )
+                certificates = [
+                    {"sha256": certificate_hash, "data": certificate_data[certificate_hash]}
+                    for certificate_hash in certificate_hashes
+                    if certificate_hash in certificate_data
+                ]
                 result["certificates"] = certificates
                 print(f"[+] Found {len(certificates)} related certificates", file=sys.stderr)
             except RuntimeError as exc:
                 print(f"[!] Certificate enrichment failed for {domain}: {exc}", file=sys.stderr)
                 result["certificates"] = []
+                errors.append(f"certificate index: {exc}")
                 failed = True
+                if args.progress:
+                    print(
+                        f"[!] {domain} CTL certificate index failed after "
+                        f"{time.monotonic() - certificate_started:.3f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            timings["certificate_stage_seconds"] = round(time.monotonic() - certificate_started, 3)
 
+        result["complete"] = not errors
+        result["errors"] = errors
+        timings["total_seconds"] = round(time.monotonic() - domain_started, 3)
         results.append(result)
         if args.resolve or args.probe:
             active_label = colorize(
@@ -644,7 +810,7 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
     )
     if args.output:
         try:
-            args.output.write_text(content, encoding="utf-8")
+            write_output_atomic(args.output, content)
         except OSError as exc:
             print(f"error: could not write {args.output}: {exc}", file=sys.stderr)
             return 1

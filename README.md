@@ -13,9 +13,8 @@ Python 3. No Shodan API key or third-party packages are required.
 Use this tool only against assets you own or are explicitly authorized to test.
 The examples use `example.com` as a placeholder; replace it with an authorized domain.
 
-The latest published GitHub release is [v1.0.5](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5)
-(2026-08-17). The working tree prepares version `1.1.0`; publish it by pushing
-the `v1.1.0` tag after review.
+The latest published GitHub release is [v1.1.0](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.1.0)
+(2026-10-21).
 
 ## Requirements
 

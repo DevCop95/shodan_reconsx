@@ -13,8 +13,8 @@ Python 3. No Shodan API key or third-party packages are required.
 Use this tool only against assets you own or are explicitly authorized to test.
 The examples use `example.com` as a placeholder; replace it with an authorized domain.
 
-The latest published GitHub release is [v1.1.0](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.1.0)
-(2026-10-21).
+The latest release is [v1.2.0](https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.2.0)
+(2026-11-27).
 
 ## Requirements
 
@@ -122,22 +122,32 @@ first filter. To check TCP and HTTP reachability and keep only active results:
 ./scan.sh example.com --probe --active-only --status --probe-timeout 3
 ```
 
-`--probe` makes TCP and HTTP/HTTPS checks on ports 443 and 80 and records the
-reachable ports and HTTP status codes in JSON as `ports` and `http`. It is
-intentionally opt-in and should only be used on domains you own or are
-authorized to test. Hostnames returned by CTL must be valid names within the
-requested domain. HTTP checks do not follow redirects, keeping requests within
-the selected hostname. With `--probe`, `--active-only` removes `STALE` and
-`DNS_ONLY` names from the output; with `--resolve` alone it keeps names that
-resolve in DNS. Without the filter, the tool reports every state.
+`--probe` makes TCP and HTTP/HTTPS checks on ports 443 and 80 (reusing
+resolved IPs for TCP probes) and records the reachable ports and HTTP status
+codes in JSON as `ports` and `http`. It is intentionally opt-in and should only
+be used on domains you own or are authorized to test. Single-wildcard CT names
+(`*.sub.example.com`) are normalized to their base hostname; invalid or
+out-of-scope CTL entries are skipped with a warning and recorded in JSON as
+`skipped_hostnames` rather than aborting the domain. HTTP checks do not follow
+redirects, keeping requests within the selected hostname. If strict TLS
+verification fails on port 443 (self-signed, expired, or mismatched
+certificate), the host is classified as `TCP_REACHABLE` and JSON includes
+`tls_error`; pass `-k` / `--insecure` (opt-in, requires `--probe` or `--live`)
+to skip TLS certificate verification during HTTPS probes. With `--probe`,
+`--active-only` removes `STALE` and `DNS_ONLY` names from the output; with
+`--resolve` alone it keeps names that resolve in DNS. Without the filter, the
+tool reports every state.
 
 When resolving or probing, stderr prints DNS/TCP/HTTP/stale counters, also
 included in each domain's JSON `summary` object. These cover only the hostnames
 selected by `--max-hosts`, before `--active-only` filtering, not the full CTL
-inventory when capped. JSON retains selected hostname details unless filtered.
+inventory when capped; JSON also records `discovered_hostnames` and `truncated`
+(and `discovered_certificates` / `certificates_truncated` with
+`--certificates`). JSON retains selected hostname details unless filtered.
 
-In an interactive terminal, status output uses a fixed-width table and
-truncates long hostnames or IPv6 lists so rows do not wrap. Redirected output
+In an interactive terminal, status output uses a fixed-width table displaying
+IPs and reachable ports (`IP / PORT`) and scales cleanly to narrow terminals
+(such as 60-column Termux sessions) without wrapping rows. Redirected output
 and files keep the complete tab-separated values.
 
 For a bounded live scan:
@@ -166,7 +176,8 @@ The JSON result keeps the existing `domain` and `hostnames` fields, adds an
 `errors`, and per-stage `timings`. A partial result is marked incomplete and
 the process exits nonzero; always check the exit code before consuming output.
 Fetching requires `--certificates`; a limit alone does not enable it. Use
-`--format json` to display certificate data: TXT output does not include it,
+`--format json` to display certificate data: TXT output does not include it
+(and prints a stderr warning if `--certificates` is used with `--format txt`),
 even though `--certificates` still performs the requests. Certificate details
 are fetched concurrently, in stable hash order, using `--certificate-workers`.
 
@@ -209,16 +220,21 @@ output file as a new successful result after a timeout.
   DNS deadline; use `--max-time` for that. All three timeout options require
   positive finite seconds within the platform's supported range; NaN and infinity
   are rejected.
+- `-k` / `--insecure` skips TLS certificate verification during HTTPS probes
+  (requires `--probe` or `--live`). Without it, TLS errors are captured in
+  JSON as `tls_error`.
 - `--retries` (default `2`) controls CTL retries. Transient transport failures,
-  HTTP 408/425/429, and HTTP 5xx responses are retried with bounded backoff;
-  `Retry-After` is honored up to 60 seconds. Other HTTP 4xx responses fail
-  immediately. Malformed HTTP probe responses are ignored.
+  empty response bodies, HTTP 408/425/429, and HTTP 5xx responses are retried
+  with bounded backoff; numeric and HTTP-date `Retry-After` headers are honored
+  up to 60 seconds. Other HTTP 4xx responses fail immediately. Malformed HTTP
+  probe responses are ignored.
 
-Output files are replaced atomically after serialization completes. A scan with
-per-domain errors still writes a JSON result with `complete: false` and an
-`errors` list, then returns a nonzero exit code. A deadline can still terminate
-the worker before final serialization, so it does not guarantee a new output
-file.
+`--output` destinations are validated before network requests start, and output
+files are replaced atomically via a private temporary file with `fsync` after
+serialization completes. A scan with per-domain errors still writes a JSON
+result with `complete: false` and an `errors` list, then returns a nonzero exit
+code. A deadline can still terminate the worker before final serialization, so
+it does not guarantee a new output file.
 
 Exit codes: `0` success; `1` query, output-write, or deadline error; `2` invalid
 arguments/input; `130` interrupt. Check the exit code before consuming results.

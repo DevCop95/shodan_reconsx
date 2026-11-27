@@ -1,4 +1,5 @@
 import contextlib
+import gzip
 import http.client
 import io
 import json
@@ -6,6 +7,7 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import signal
+import ssl
 import sys
 import tempfile
 import threading
@@ -44,7 +46,7 @@ def quick_scan_process(args, domains):
 
 class DomainTests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(recons101x.__version__, "1.1.0")
+        self.assertEqual(recons101x.__version__, "1.2.0")
 
     def test_normalizes_domain(self):
         self.assertEqual(recons101x.normalize_domain(" Example.COM. "), "example.com")
@@ -80,15 +82,55 @@ class DomainTests(unittest.TestCase):
         )
 
     @mock.patch("recons101x.urllib.request.urlopen")
-    def test_rejects_hostnames_outside_requested_scope(self, urlopen):
+    def test_skips_invalid_and_out_of_scope_hostnames_and_normalizes_wildcards(self, urlopen):
         response = mock.MagicMock()
         response.__enter__.return_value = response
+        response.headers = {}
         response.read.return_value = json.dumps(
-            ["www.example.com", "notexample.com"]
+            [
+                "www.example.com",
+                "*.api.example.com",
+                "_dmarc.example.com",
+                "notexample.com",
+                "*.*.example.com",
+            ]
         ).encode()
         urlopen.return_value = response
-        with self.assertRaisesRegex(RuntimeError, "outside example.com"):
-            recons101x.fetch_hostnames("example.com", timeout=1, retries=0)
+        skipped: list[int] = []
+        self.assertEqual(
+            recons101x.fetch_hostnames("example.com", timeout=1, retries=0, skipped=skipped),
+            ["api.example.com", "www.example.com"],
+        )
+        self.assertEqual(skipped, [3])
+
+    def test_normalize_hostname_rejects_out_of_scope_directly(self):
+        with self.assertRaisesRegex(ValueError, "outside example.com"):
+            recons101x.normalize_hostname("notexample.com", "example.com")
+        self.assertEqual(
+            recons101x.normalize_hostname("*.sub.example.com", "example.com"),
+            "sub.example.com",
+        )
+
+    @mock.patch("recons101x.urllib.request.urlopen")
+    def test_fetch_json_decompresses_gzip_and_reports_empty_body_clearly(self, urlopen):
+        gz_response = mock.MagicMock()
+        gz_response.__enter__.return_value = gz_response
+        gz_response.headers = {"Content-Encoding": "gzip"}
+        gz_response.read.return_value = gzip.compress(b'["www.example.com"]')
+        urlopen.return_value = gz_response
+        self.assertEqual(
+            recons101x.fetch_json("https://ctl.shodan.io/test", timeout=1, retries=0),
+            ["www.example.com"],
+        )
+
+        empty_response = mock.MagicMock()
+        empty_response.__enter__.return_value = empty_response
+        empty_response.headers = {}
+        empty_response.status = 200
+        empty_response.read.return_value = b""
+        urlopen.return_value = empty_response
+        with self.assertRaisesRegex(RuntimeError, "empty response body"):
+            recons101x.fetch_json("https://ctl.shodan.io/test", timeout=1, retries=0)
 
     def test_atomic_output_preserves_old_file_if_replacement_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,27 +181,62 @@ class DomainTests(unittest.TestCase):
         self.assertIn("\033[1;32mACTIVE\033[0m", output)
         self.assertIn("INACTIVE", output)
 
-    def test_pretty_output_is_fixed_width_and_truncates_long_values(self):
+    def test_pretty_output_fits_narrow_widths_and_displays_ports(self):
         results = [
             {
-                "domain": "example.com",
+                "domain": "example-corp.co.uk",
                 "hostnames": [
                     {
-                        "hostname": "very-long-hostname-" + "x" * 100 + ".example.com",
+                        "hostname": "very-long-hostname-" + "x" * 100 + ".example-corp.co.uk",
                         "ips": ["2001:db8::1", "2001:db8::2"],
-                        "state": "DNS_ONLY",
+                        "ports": [443, 80],
+                        "state": "HTTP_REACHABLE",
                         "active": True,
-                    }
+                    },
+                    {
+                        "hostname": "stale.example-corp.co.uk",
+                        "ips": [],
+                        "ports": [],
+                        "state": "STALE",
+                        "active": False,
+                    },
                 ],
             }
         ]
-        output = recons101x.format_text(
-            results, include_ips=True, include_status=True, pretty=True, width=80
+        for width in (60, 80):
+            with self.subTest(width=width):
+                output = recons101x.format_text(
+                    results, include_ips=True, include_status=True, pretty=True, width=width
+                )
+                self.assertLessEqual(max(map(len, output.rstrip().splitlines())), width)
+        wide = recons101x.format_text(
+            results, include_ips=True, include_status=True, pretty=True, width=120
         )
-        self.assertIn("DOMAIN", output)
-        self.assertIn("DNS_ONLY", output)
-        self.assertIn("...", output)
-        self.assertLessEqual(max(map(len, output.rstrip().splitlines())), 80)
+        self.assertIn("2001:db8::1,...:443,80", wide)
+        probe_only = recons101x.format_text(
+            results, include_ips=False, include_status=True, pretty=True, width=100
+        )
+        self.assertIn("443,80", probe_only)
+
+    @mock.patch("recons101x.socket.create_connection")
+    def test_probe_hostname_reuses_resolved_ips_without_extra_dns(self, create_connection):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        create_connection.side_effect = [OSError("v4 refused"), connection, OSError("closed"), OSError("closed")]
+
+        self.assertEqual(
+            recons101x.probe_hostname("online.example.com", timeout=1, ips=["192.0.2.1", "192.0.2.2"]),
+            [443],
+        )
+        self.assertEqual(
+            [call.args for call in create_connection.call_args_list],
+            [
+                (("192.0.2.1", 443),),
+                (("192.0.2.2", 443),),
+                (("192.0.2.1", 80),),
+                (("192.0.2.2", 80),),
+            ],
+        )
 
     def test_classifies_reachability_and_builds_summary(self):
         entries = [
@@ -270,8 +347,34 @@ class ReliabilityTests(NetworkIsolatedTests):
                     recons101x.probe_http_services("example.com", [443, 80], timeout=1),
                     {"http": 503},
                 )
-                self.assertEqual(build_opener.call_count, 2)
+                self.assertEqual(build_opener.call_count, 1)
                 self.assertEqual(opener.open.call_count, 2)
+
+    def test_probe_http_records_tls_error_and_supports_insecure_opt_in(self):
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.URLError(ssl.SSLCertVerificationError(1, "self signed"))
+        tls_errors: dict[str, str] = {}
+        with mock.patch("recons101x.urllib.request.build_opener", return_value=opener):
+            self.assertEqual(
+                recons101x.probe_http_services("example.com", [443], timeout=1, tls_errors=tls_errors),
+                {},
+            )
+        self.assertIn("https", tls_errors)
+        self.assertIn("self signed", tls_errors["https"])
+
+        ok_response = mock.MagicMock()
+        ok_response.__enter__.return_value = ok_response
+        ok_response.status = 200
+        insecure_opener = mock.Mock()
+        insecure_opener.open.return_value = ok_response
+        with mock.patch("recons101x.urllib.request.build_opener", return_value=insecure_opener) as build_opener:
+            self.assertEqual(
+                recons101x.probe_http_services("example.com", [443], timeout=1, insecure=True),
+                {"https": 200},
+            )
+        self.assertEqual(len(build_opener.call_args.args), 2)
+        self.assertIs(build_opener.call_args.args[0], recons101x.NoRedirectHandler)
+        self.assertIsInstance(build_opener.call_args.args[1], recons101x.urllib.request.HTTPSHandler)
 
     def test_probe_http_does_not_follow_redirects(self):
         opener = mock.Mock()
@@ -318,6 +421,16 @@ class ReliabilityTests(NetworkIsolatedTests):
             self.assertEqual(recons101x.fetch_json("https://ctl.shodan.io/", timeout=1, retries=1), {"ok": True})
         sleep.assert_called_once_with(3.0)
 
+    def test_retry_after_ignores_nonfinite_values_and_parses_http_date(self):
+        for bad in ("nan", "inf", "-inf"):
+            err = urllib.error.HTTPError("https://ctl.shodan.io/", 429, "rl", {"Retry-After": bad}, None)
+            with self.subTest(bad=bad), mock.patch("recons101x.random.uniform", return_value=0.0):
+                self.assertEqual(recons101x.retry_delay(err, 0), 1.0)
+        future_err = urllib.error.HTTPError(
+            "https://ctl.shodan.io/", 429, "rl", {"Retry-After": "Mon, 21 Oct 2030 00:00:00 GMT"}, None
+        )
+        self.assertEqual(recons101x.retry_delay(future_err, 0), 60.0)
+
     def test_check_hostname_runs_only_applicable_stages_in_order(self):
         cases = (
             (False, False, [], [], {}),
@@ -345,9 +458,9 @@ class ReliabilityTests(NetworkIsolatedTests):
                 if resolve or probe:
                     expected_calls.append(mock.call.resolve("example.com"))
                 if probe and ips:
-                    expected_calls.append(mock.call.probe("example.com", 0.5))
+                    expected_calls.append(mock.call.probe("example.com", 0.5, ips=ips))
                 if probe and ports:
-                    expected_calls.append(mock.call.http("example.com", ports, 0.5))
+                    expected_calls.append(mock.call.http("example.com", ports, 0.5, tls_errors={}))
                 self.assertEqual(stages.mock_calls, expected_calls)
                 self.assertEqual(
                     entry,
@@ -362,7 +475,7 @@ class ScanTests(NetworkIsolatedTests):
         super().setUp()
         self.stdout = self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stderr = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-        self.stack.enter_context(mock.patch("recons101x.os.system"))
+        self.stack.enter_context(mock.patch("recons101x._enable_windows_ansi"))
         self.stack.enter_context(mock.patch.dict(os.environ))
         os.environ.pop("NO_COLOR", None)
         self.hostnames = ["z.example.com", "a.example.com", "m.example.com"]
@@ -422,7 +535,17 @@ class ScanTests(NetworkIsolatedTests):
                 self.assertEqual(raised.exception.code, 0)
                 banner.assert_not_called()
                 self.fetch_hostnames.assert_not_called()
-        self.assertIn("1.1.0", self.stdout.getvalue())
+        self.assertIn("1.2.0", self.stdout.getvalue())
+
+    def test_insecure_requires_probe_and_invalid_output_path_rejected_before_network(self):
+        self.assertEqual(recons101x.main(["example.com", "--insecure"]), 2)
+        self.fetch_hostnames.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing_dir_file = Path(directory) / "does_not_exist" / "out.json"
+            self.assertEqual(recons101x.main(["example.com", "-o", str(missing_dir_file)]), 2)
+            self.assertEqual(recons101x.main(["example.com", "-o", directory]), 2)
+            self.fetch_hostnames.assert_not_called()
 
     def test_no_color_suppresses_all_ansi_on_ttys(self):
         for options, env in ((["--no-color"], {}), (["--color"], {"NO_COLOR": ""})):
@@ -451,7 +574,7 @@ class ScanTests(NetworkIsolatedTests):
                 self.assertTrue(second_probed.wait(2), "HTTP must not wait for every DNS lookup")
             return ["192.0.2.1"]
 
-        def http(hostname, ports, timeout):
+        def http(hostname, ports, timeout, **kwargs):
             if hostname == self.hostnames[1]:
                 second_probed.set()
             return {"https": 200}
@@ -469,7 +592,7 @@ class ScanTests(NetworkIsolatedTests):
 
     def test_live_filters_dns_only_hosts_but_summary_counts_all_selected_hosts(self):
         self.resolve_hostname.side_effect = lambda hostname: [] if hostname == self.hostnames[0] else ["192.0.2.1"]
-        self.probe_hostname.side_effect = lambda hostname, timeout: [443] if hostname == self.hostnames[2] else []
+        self.probe_hostname.side_effect = lambda hostname, timeout, ips=None: [443] if hostname == self.hostnames[2] else []
         self.assertEqual(recons101x.main(["example.com", "--live", "--format", "json"]), 0)
         result = json.loads(self.stdout.getvalue())[0]
         self.assertEqual([entry["hostname"] for entry in result["hostnames"]], self.hostnames[2:])
@@ -481,6 +604,8 @@ class ScanTests(NetworkIsolatedTests):
         self.assertEqual(recons101x.main(["example.com", "--live", "--max-hosts", "2", "--format", "json"]), 0)
         result = json.loads(self.stdout.getvalue())[0]
         self.assertEqual([entry["hostname"] for entry in result["hostnames"]], self.hostnames[:2])
+        self.assertEqual(result["discovered_hostnames"], 3)
+        self.assertTrue(result["truncated"])
         self.assertEqual(result["summary"], {"total": 2, "dns": 2, "tcp": 2, "http": 2, "stale": 0})
         for stage in (self.resolve_hostname, self.probe_hostname, self.probe_http_services):
             self.assertCountEqual([call.args[0] for call in stage.call_args_list], self.hostnames[:2])
@@ -512,13 +637,16 @@ class ScanTests(NetworkIsolatedTests):
         ]), 0)
         result = json.loads(self.stdout.getvalue())[0]
         self.assertEqual([item["sha256"] for item in result["certificates"]], self.hashes[:2])
+        self.assertEqual(result["discovered_certificates"], 3)
+        self.assertTrue(result["certificates_truncated"])
         self.assertCountEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes[:2])
         self.assertRegex(self.stderr.getvalue().lower(), r"(?m).*cert.*(?:limit|truncat)|.*(?:limit|truncat).*cert")
 
-    def test_certificates_remain_unlimited_and_txt_behavior_is_unchanged(self):
+    def test_certificates_remain_unlimited_and_txt_behavior_warns_on_stderr(self):
         self.assertEqual(recons101x.main(["example.com", "--certificates", "--format", "txt"]), 0)
         self.assertCountEqual([call.args[0] for call in self.fetch_certificate.call_args_list], self.hashes)
         self.assertEqual(self.stdout.getvalue(), "".join(f"example.com\t{host}\n" for host in self.hostnames))
+        self.assertIn("--format json", self.stderr.getvalue())
 
     def test_certificate_cap_does_not_enable_certificate_queries(self):
         self.assertEqual(recons101x.main(["example.com", "--max-certificates", "1"]), 0)

@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-27
+
+### Added
+
+- Opt-in `-k`/`--insecure` flag for HTTPS probes against hosts with self-signed, expired, or mismatched TLS certificates, plus `tls_error` reporting in JSON when strict verification fails.
+- JSON truncation and filtering metadata: `discovered_hostnames`, `truncated`, `skipped_hostnames` (when nonzero), `discovered_certificates`, and `certificates_truncated`.
+- `Accept-Encoding: gzip` support and transparent gzip decompression in CTL JSON requests.
+- Early validation of `--output` destination before network requests begin, and a `stderr` warning when `--certificates` is used with `--format txt`.
+
+### Changed
+
+- Normalize single-wildcard CT entries (`*.sub.example.com` -> `sub.example.com`) and skip invalid or out-of-scope hostnames with a warning instead of aborting the entire domain scan.
+- Reuse resolved IPs during TCP probing to reduce redundant DNS lookups and reuse one HTTP opener per host.
+- Enable ANSI escape sequences on Windows via `ctypes` `SetConsoleMode` instead of `os.system("")`.
+- Use `tempfile.NamedTemporaryFile` with `fsync` in `write_output_atomic` to avoid predictable temporary filenames.
+
+### Fixed
+
+- Render reachable ports in the `IP / PORT` column of the interactive table, show `-` for empty IP lists, and keep narrow terminal widths (e.g., 60 columns) from overflowing.
+- Ignore non-finite `Retry-After` values (`nan`/`inf`) and parse HTTP-date headers with locale-independent `email.utils.parsedate_to_datetime`.
+- Report empty CTL `HTTP 200` responses clearly instead of a raw JSON decoder error.
+
 ## [1.1.0] - 2026-10-20
 
 ### Added
@@ -43,7 +65,8 @@ All notable changes to this project are documented here.
 - Domain validation, retries, timeout controls, and IDN support.
 - Cross-platform tests and automated GitHub releases.
 
-[Unreleased]: https://github.com/DevCop95/shodan_reconsx/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/DevCop95/shodan_reconsx/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/DevCop95/shodan_reconsx/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/DevCop95/shodan_reconsx/compare/v1.0.5...v1.1.0
 [1.0.0]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.0
 [1.0.5]: https://github.com/DevCop95/shodan_reconsx/releases/tag/v1.0.5

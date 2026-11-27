@@ -6,7 +6,8 @@ Security fixes are provided for the latest release.
 
 | Version | Supported |
 | ------- | --------- |
-| 1.1.x   | Yes       |
+| 1.2.x   | Yes       |
+| 1.1.x   | No        |
 | 1.0.x   | No        |
 | < 1.0   | No        |
 
@@ -15,7 +16,10 @@ Security fixes are provided for the latest release.
 Passive enumeration queries Shodan CTL. DNS resolution and TCP/HTTP checks are
 opt-in and must only be used for domains you own or are authorized to assess.
 Active checks are limited to ports 80 and 443, use HTTP `HEAD`, validate CTL
-hostnames against the requested domain, and do not follow HTTP redirects.
+hostnames against the requested domain (skipping invalid or out-of-scope
+entries), verify TLS certificates by default (unless `-k`/`--insecure` is
+explicitly passed with `--probe` or `--live`), and do not follow HTTP
+redirects.
 
 ## Reporting a Vulnerability
 

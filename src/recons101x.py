@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ctypes
 import datetime as dt
+import email.utils
+import gzip
 import http.client
 import json
 import math
@@ -14,9 +17,11 @@ import multiprocessing.connection
 import os
 import random
 import re
-import socket
 import shutil
+import socket
+import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -29,9 +34,12 @@ DOMAIN_API_URL = "https://ctl.shodan.io/api/v1/domain/{domain}"
 HOSTNAMES_API_URL = "https://ctl.shodan.io/api/v1/domain/{domain}/hostnames"
 CERT_API_URL = "https://ctl.shodan.io/api/v1/cert/{sha256}"
 API_URL = HOSTNAMES_API_URL  # Backwards-compatible name for integrations.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+STD_OUTPUT_HANDLE = -11
+STD_ERROR_HANDLE = -12
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 BANNER = r"""
  ██▀███  ▓█████  ▄████▄   ▒█████   ███▄    █   ██████    ████     █████    ████   ▒██   ██▒
 ▓██ ▒ ██▒▓█   ▀ ▒██▀ ▀█  ▒██▒  ██▒ ██ ▀█   █ ▒██    ▒  ░░███   ███░░░███ ░░███   ▒▒ █ █ ▒░
@@ -46,13 +54,30 @@ BANNER = r"""
 """
 
 
+def _enable_windows_ansi() -> None:
+    """Enable ANSI escape processing on Windows consoles without invoking a shell."""
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (STD_OUTPUT_HANDLE, STD_ERROR_HANDLE):
+            handle = kernel32.GetStdHandle(handle_id)
+            if not handle or handle == -1:
+                continue
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except (AttributeError, OSError):
+        pass
+
+
 def print_banner(no_color: bool = False) -> None:
     use_color = not no_color and color_enabled(stream=sys.stderr)
     if os.name == "nt":
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8")
         if use_color:
-            os.system("")  # Enable ANSI processing in supported Windows terminals.
+            _enable_windows_ansi()
     if use_color:
         print(f"\033[1;31m{BANNER}\033[0m", file=sys.stderr)
     else:
@@ -77,8 +102,11 @@ def normalize_domain(value: str) -> str:
 
 def normalize_hostname(value: str, domain: str) -> str:
     """Validate and normalize a hostname returned for a requested domain."""
+    candidate = value.strip()
+    if candidate.startswith("*."):
+        candidate = candidate[2:]
     try:
-        hostname = normalize_domain(value)
+        hostname = normalize_domain(candidate)
     except ValueError as exc:
         raise ValueError(f"invalid hostname returned by CTL: {value!r}") from exc
     if hostname != domain and not hostname.endswith(f".{domain}"):
@@ -86,39 +114,58 @@ def normalize_hostname(value: str, domain: str) -> str:
     return hostname
 
 
-def fetch_hostnames(domain: str, timeout: float, retries: int) -> list[str]:
+def filter_hostnames(items: Iterable[str], domain: str) -> tuple[list[str], int]:
+    """Return sorted valid in-scope hostnames and count of skipped invalid/out-of-scope entries."""
+    valid: set[str] = set()
+    skipped = 0
+    for item in items:
+        try:
+            valid.add(normalize_hostname(item, domain))
+        except ValueError:
+            skipped += 1
+    return sorted(valid), skipped
+
+
+def fetch_hostnames(
+    domain: str,
+    timeout: float,
+    retries: int,
+    skipped: list[int] | None = None,
+) -> list[str]:
     payload = fetch_json(
         HOSTNAMES_API_URL.format(domain=domain), timeout=timeout, retries=retries
     )
     if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
         raise RuntimeError(f"could not query {domain}: unexpected API response")
-    try:
-        hostnames = {normalize_hostname(item, domain) for item in payload}
-    except ValueError as exc:
-        raise RuntimeError(f"could not query {domain}: {exc}") from exc
-    return sorted(hostnames)
+    hostnames, skipped_count = filter_hostnames(payload, domain)
+    if skipped is not None:
+        skipped.append(skipped_count)
+    return hostnames
 
 
 def retry_delay(error: Exception, attempt: int) -> float:
-    """Return a bounded retry delay, honoring numeric Retry-After values."""
+    """Return a bounded retry delay, honoring numeric or HTTP-date Retry-After values."""
     if isinstance(error, urllib.error.HTTPError):
         retry_after = error.headers.get("Retry-After") if error.headers else None
         if retry_after:
             try:
-                return min(60.0, max(0.0, float(retry_after)))
+                seconds = float(retry_after)
+                if math.isfinite(seconds):
+                    return min(60.0, max(0.0, seconds))
             except ValueError:
                 try:
-                    retry_at = dt.datetime.strptime(
-                        retry_after, "%a, %d %b %Y %H:%M:%S GMT"
-                    ).replace(tzinfo=dt.timezone.utc)
-                    return min(
-                        60.0,
-                        max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds()),
-                    )
-                except ValueError:
+                    retry_at = email.utils.parsedate_to_datetime(retry_after)
+                    if retry_at is not None:
+                        if retry_at.tzinfo is None:
+                            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+                        return min(
+                            60.0,
+                            max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds()),
+                        )
+                except (TypeError, ValueError):
                     pass
     base = min(float(2**attempt), 30.0)
-    return base + random.uniform(0.0, min(1.0, base * 0.1))
+    return base + random.uniform(0.0, min(1.0, base * 0.1))  # nosec B311
 
 
 def retryable_http_error(error: urllib.error.HTTPError) -> bool:
@@ -129,7 +176,11 @@ def fetch_json(url: str, timeout: float, retries: int) -> object:
     """Fetch and decode one CTL JSON response with the same retry policy."""
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": f"shodan-domain-recon/{__version__}"},
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "User-Agent": f"shodan-domain-recon/{__version__}",
+        },
     )
     last_error: Exception | None = None
 
@@ -137,7 +188,15 @@ def fetch_json(url: str, timeout: float, retries: int) -> object:
         try:
             # URLs are assembled only from validated domains or SHA-256 hashes.
             with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
-                payload = json.load(response)
+                raw = response.read()
+                headers = getattr(response, "headers", None)
+                encoding = headers.get("Content-Encoding") if headers else None
+                if isinstance(encoding, str) and encoding.lower() == "gzip" and raw:
+                    raw = gzip.decompress(raw)
+                if not raw or not raw.strip():
+                    status = getattr(response, "status", 200)
+                    raise ValueError(f"empty response body (HTTP {status})")
+                payload = json.loads(raw.decode("utf-8"))
             return payload
         except urllib.error.HTTPError as exc:
             last_error = exc
@@ -196,26 +255,52 @@ def fetch_certificate(sha256: str, timeout: float, retries: int) -> object:
 def resolve_hostname(hostname: str) -> list[str]:
     try:
         addresses = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    except socket.gaierror:
+    except OSError:
         return []
     return sorted({address[4][0] for address in addresses})
 
 
-def probe_hostname(hostname: str, timeout: float) -> list[int]:
+def probe_hostname(
+    hostname: str, timeout: float, ips: list[str] | None = None
+) -> list[int]:
     """Return reachable web ports; this is opt-in because it makes network probes."""
+    targets = ips if ips else [hostname]
     reachable_ports = []
     for port in (443, 80):
-        try:
-            with socket.create_connection((hostname, port), timeout=timeout):
-                reachable_ports.append(port)
-        except (OSError, TimeoutError):
-            continue
+        for target in targets:
+            try:
+                with socket.create_connection((target, port), timeout=timeout):
+                    reachable_ports.append(port)
+                    break
+            except (OSError, TimeoutError):
+                continue
     return reachable_ports
 
 
-def probe_http_services(hostname: str, ports: list[int], timeout: float) -> dict[str, int]:
+def _build_http_opener(insecure: bool = False) -> urllib.request.OpenerDirector:
+    if not insecure:
+        return urllib.request.build_opener(NoRedirectHandler)
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return urllib.request.build_opener(
+        NoRedirectHandler, urllib.request.HTTPSHandler(context=context)
+    )
+
+
+def probe_http_services(
+    hostname: str,
+    ports: list[int],
+    timeout: float,
+    insecure: bool = False,
+    tls_errors: dict[str, str] | None = None,
+) -> dict[str, int]:
     """Return HTTP status codes for reachable HTTPS/HTTP services."""
     statuses: dict[str, int] = {}
+    if not ports:
+        return statuses
+    # Do not follow redirects: the destination may be outside the authorized scope.
+    opener = _build_http_opener(insecure=insecure)
     for port in ports:
         scheme = "https" if port == 443 else "http"
         request = urllib.request.Request(
@@ -224,15 +309,19 @@ def probe_http_services(hostname: str, ports: list[int], timeout: float) -> dict
             headers={"User-Agent": f"shodan-domain-recon/{__version__}"},
         )
         try:
-            # Do not follow redirects: the destination may be outside the authorized scope.
-            opener = urllib.request.build_opener(NoRedirectHandler)
             with opener.open(request, timeout=timeout) as response:  # nosec B310
                 statuses[scheme] = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
             # An HTTP error still proves that an HTTP server answered.
             statuses[scheme] = exc.code
             exc.close()
-        except (OSError, http.client.HTTPException):
+        except urllib.error.URLError as exc:
+            if tls_errors is not None and isinstance(exc.reason, ssl.SSLError):
+                tls_errors[scheme] = str(exc.reason)
+            continue
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            if tls_errors is not None and isinstance(exc, ssl.SSLError):
+                tls_errors[scheme] = str(exc)
             continue
     return statuses
 
@@ -271,6 +360,7 @@ def build_hostname_entry(
     include_ips: bool,
     resolve: bool,
     probe: bool,
+    tls_errors: dict[str, str] | None = None,
 ) -> dict[str, object]:
     entry: dict[str, object] = {
         "hostname": hostname,
@@ -287,14 +377,40 @@ def build_hostname_entry(
     if probe:
         entry["ports"] = ports
         entry["http"] = http
+        if tls_errors:
+            entry["tls_error"] = tls_errors.get("https") or next(iter(tls_errors.values()))
     return entry
 
 
-def check_hostname(hostname: str, resolve: bool, probe: bool, timeout: float) -> dict[str, object]:
+def check_hostname(
+    hostname: str,
+    resolve: bool,
+    probe: bool,
+    timeout: float,
+    insecure: bool = False,
+) -> dict[str, object]:
     ips = resolve_hostname(hostname) if resolve or probe else []
-    ports = probe_hostname(hostname, timeout) if probe and ips else []
-    http = probe_http_services(hostname, ports, timeout) if ports else {}
-    return build_hostname_entry(hostname, ips, ports, http, resolve, resolve, probe)
+    ports = probe_hostname(hostname, timeout, ips=ips) if probe and ips else []
+    tls_errors: dict[str, str] = {}
+    if ports:
+        if insecure:
+            http = probe_http_services(
+                hostname, ports, timeout, insecure=True, tls_errors=tls_errors
+            )
+        else:
+            http = probe_http_services(hostname, ports, timeout, tls_errors=tls_errors)
+    else:
+        http = {}
+    return build_hostname_entry(
+        hostname,
+        ips,
+        ports,
+        http,
+        resolve,
+        resolve,
+        probe,
+        tls_errors=tls_errors or None,
+    )
 
 
 def report_progress(label: str, completed: int, total: int, enabled: bool) -> None:
@@ -366,6 +482,26 @@ def shorten(value: str, width: int) -> str:
     return value[: width - 3] + "..."
 
 
+def _format_ip_port(entry: dict[str, object], include_ips: bool) -> str:
+    raw_ips = [str(ip) for ip in entry.get("ips", [])] if include_ips else []
+    ip_text = ""
+    if raw_ips:
+        ip_text = raw_ips[0] + (",..." if len(raw_ips) > 1 else "")
+    raw_ports = entry.get("ports")
+    ports_text = (
+        ",".join(str(port) for port in raw_ports)
+        if isinstance(raw_ports, list) and raw_ports
+        else ""
+    )
+    if ip_text and ports_text:
+        return f"{ip_text}:{ports_text}"
+    if ip_text:
+        return ip_text
+    if ports_text:
+        return ports_text
+    return "-"
+
+
 def format_pretty(
     results: list[dict[str, object]],
     include_ips: bool,
@@ -378,23 +514,36 @@ def format_pretty(
     for result in results:
         domain = str(result["domain"])
         for entry in result["hostnames"]:
-            ips = ",".join(str(ip) for ip in entry.get("ips", [])) if include_ips else "-"
-            if len(ips) > 1 and "," in ips:
-                ips = ips.split(",", 1)[0] + ",..."
+            ip_port = _format_ip_port(entry, include_ips)
             status = ""
             if include_status:
                 active = bool(entry.get("active"))
                 status = str(entry.get("state", "ACTIVE" if active else "INACTIVE"))
-            rows.append((domain, str(entry["hostname"]), ips, status))
+            rows.append((domain, str(entry["hostname"]), ip_port, status))
 
     if not rows:
         return ""
 
-    state_width = max(7, max(len(row[3]) for row in rows)) if include_status else 0
+    effective_width = max(40, width)
+    separators = 6 if include_status else 4
+    state_width = max(len("STATE"), max(len(row[3]) for row in rows)) if include_status else 0
     domain_width = min(24, max(len("DOMAIN"), max(len(row[0]) for row in rows)))
     ip_width = min(38, max(len("IP / PORT"), max(len(row[2]) for row in rows)))
-    separators = 9 if include_status else 7
-    host_width = max(18, width - domain_width - ip_width - state_width - separators)
+    available = effective_width - separators - state_width
+    min_host = 12
+    if domain_width + ip_width + min_host > available:
+        excess = domain_width + ip_width + min_host - available
+        shrink_ip = min(excess, max(0, ip_width - len("IP / PORT")))
+        ip_width -= shrink_ip
+        excess -= shrink_ip
+        shrink_domain = min(excess, max(0, domain_width - len("DOMAIN")))
+        domain_width -= shrink_domain
+        excess -= shrink_domain
+        if excess > 0 and include_status:
+            shrink_state = min(excess, max(0, state_width - len("STATE")))
+            state_width -= shrink_state
+            available = effective_width - separators - state_width
+    host_width = max(8, available - domain_width - ip_width)
     if include_status:
         header = (
             f"{'DOMAIN':<{domain_width}}  {'HOSTNAME':<{host_width}}  "
@@ -403,7 +552,7 @@ def format_pretty(
     else:
         header = f"{'DOMAIN':<{domain_width}}  {'HOSTNAME':<{host_width}}  {'IP / PORT':<{ip_width}}"
 
-    lines = [header, "-" * min(width, len(header))]
+    lines = [header, "-" * min(effective_width, len(header))]
     state_colors = {
         "HTTP_REACHABLE": "1;32",
         "TCP_REACHABLE": "1;32",
@@ -412,11 +561,11 @@ def format_pretty(
         "ACTIVE": "1;32",
         "INACTIVE": "2;31",
     }
-    for domain, hostname, ips, status in rows:
+    for domain, hostname, ip_port, status in rows:
         fields = [
             shorten(domain, domain_width).ljust(domain_width),
             shorten(hostname, host_width).ljust(host_width),
-            shorten(ips, ip_width).ljust(ip_width),
+            shorten(ip_port, ip_width).ljust(ip_width),
         ]
         if include_status:
             visible_status = shorten(status, state_width).ljust(state_width)
@@ -439,17 +588,51 @@ def colorize(text: str, code: str, enabled: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if enabled else text
 
 
+def validate_output_path(path: Path) -> None:
+    """Verify early that the output destination can be created and written."""
+    if path.exists() and path.is_dir():
+        raise ValueError(f"output path is a directory: {path}")
+    parent = path.parent if str(path.parent) else Path(".")
+    if not parent.exists() or not parent.is_dir():
+        raise ValueError(f"output directory does not exist: {parent}")
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=True,
+        ):
+            pass
+    except OSError as exc:
+        raise ValueError(f"output path is not writable ({path}): {exc}") from exc
+
+
 def write_output_atomic(path: Path, content: str) -> None:
     """Replace an output file only after its complete contents are written."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    parent = path.parent if str(path.parent) else Path(".")
+    temporary: Path | None = None
     try:
-        temporary.write_text(content, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def utc_timestamp() -> str:
@@ -474,6 +657,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="probe TCP and HTTP(S) on ports 443/80 (opt-in)",
+    )
+    parser.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="skip TLS certificate verification during HTTPS probes (requires --probe or --live)",
     )
     parser.add_argument(
         "--active-only",
@@ -556,9 +745,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.active_only and not (args.resolve or args.probe):
         print("error: --active-only requires --resolve or --probe", file=sys.stderr)
         return 2
+    if args.insecure and not args.probe:
+        print("error: --insecure requires --probe or --live", file=sys.stderr)
+        return 2
 
     try:
         domains = read_domains(args.domains, args.input)
+        if args.output is not None:
+            validate_output_path(args.output)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -620,7 +814,13 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
         if args.progress:
             print(f"[+] {domain} CTL hostname index: requesting", file=sys.stderr, flush=True)
         hostname_query_started = time.monotonic()
+        skipped_counts: list[int] = []
         try:
+            hostnames = fetch_hostnames(
+                domain, args.timeout, args.retries, skipped=skipped_counts
+            )
+        except TypeError:
+            # Compatibility with tests/callers patching fetch_hostnames(domain, timeout, retries).
             hostnames = fetch_hostnames(domain, args.timeout, args.retries)
         except RuntimeError as exc:
             print(f"[-] {exc}", file=sys.stderr)
@@ -646,6 +846,12 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
             })
             continue
         timings["hostname_index_seconds"] = round(time.monotonic() - hostname_query_started, 3)
+        skipped_hostnames = skipped_counts[0] if skipped_counts else 0
+        if skipped_hostnames:
+            print(
+                f"[!] Skipped {skipped_hostnames} invalid or out-of-scope hostnames for {domain}",
+                file=sys.stderr,
+            )
         if args.progress:
             print(
                 f"[+] {domain} CTL hostname index: {len(hostnames)} names in "
@@ -654,12 +860,15 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
                 flush=True,
             )
 
+        discovered_hostnames = len(hostnames)
+        truncated_hostnames = False
         if args.max_hosts is not None and len(hostnames) > args.max_hosts:
             print(
                 f"[!] Limiting {domain} to {args.max_hosts} of {len(hostnames)} hostnames",
                 file=sys.stderr,
             )
             hostnames = hostnames[:args.max_hosts]
+            truncated_hostnames = True
 
         hostname_checks_started = time.monotonic()
         if (args.resolve or args.probe) and hostnames:
@@ -667,12 +876,27 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {
                     executor.submit(
-                        check_hostname, hostname, args.resolve, args.probe, args.probe_timeout
+                        check_hostname,
+                        hostname,
+                        args.resolve,
+                        args.probe,
+                        args.probe_timeout,
+                        args.insecure,
                     ): hostname
                     for hostname in hostnames
                 }
                 for completed, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                    entries_by_hostname[futures[future]] = future.result()
+                    hostname = futures[future]
+                    try:
+                        entries_by_hostname[hostname] = future.result()
+                    except Exception as exc:
+                        message = f"hostname {hostname}: {exc}"
+                        print(f"[!] Could not check {message}", file=sys.stderr)
+                        errors.append(message)
+                        failed = True
+                        entries_by_hostname[hostname] = build_hostname_entry(
+                            hostname, [], [], {}, args.resolve, args.resolve, args.probe
+                        )
                     report_progress(
                         f"{domain} hostnames", completed, len(hostnames), args.progress
                     )
@@ -695,19 +919,30 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
             "source": "Shodan CTL",
             "queried_at": utc_timestamp(),
             "complete": True,
+            "discovered_hostnames": discovered_hostnames,
+            "truncated": truncated_hostnames,
             "errors": errors,
             "timings": timings,
             "hostnames": hostname_entries,
         }
+        if skipped_hostnames:
+            result["skipped_hostnames"] = skipped_hostnames
         if args.resolve or args.probe:
             result["summary"] = summary
 
         if args.certificates:
+            if args.format == "txt":
+                print(
+                    "[!] --certificates data is only included in --format json output",
+                    file=sys.stderr,
+                )
             certificate_started = time.monotonic()
             if args.progress:
                 print(f"[+] {domain} CTL certificate index: requesting", file=sys.stderr, flush=True)
             try:
                 certificate_hashes = fetch_certificate_hashes(domain, args.timeout, args.retries)
+                discovered_certificates = len(certificate_hashes)
+                certificates_truncated = False
                 if args.progress:
                     print(
                         f"[+] {domain} CTL certificate index: {len(certificate_hashes)} hashes in "
@@ -722,6 +957,7 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
                         file=sys.stderr,
                     )
                     certificate_hashes = certificate_hashes[:args.max_certificates]
+                    certificates_truncated = True
                 certificate_data: dict[str, object] = {}
                 if certificate_hashes:
                     with concurrent.futures.ThreadPoolExecutor(
@@ -752,10 +988,14 @@ def scan_domains(args: argparse.Namespace, domains: list[str]) -> int:
                     for certificate_hash in certificate_hashes
                     if certificate_hash in certificate_data
                 ]
+                result["discovered_certificates"] = discovered_certificates
+                result["certificates_truncated"] = certificates_truncated
                 result["certificates"] = certificates
                 print(f"[+] Found {len(certificates)} related certificates", file=sys.stderr)
             except RuntimeError as exc:
                 print(f"[!] Certificate enrichment failed for {domain}: {exc}", file=sys.stderr)
+                result["discovered_certificates"] = 0
+                result["certificates_truncated"] = False
                 result["certificates"] = []
                 errors.append(f"certificate index: {exc}")
                 failed = True
